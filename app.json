@@ -1,0 +1,31 @@
+{
+  "name": "Pyrogram Script Generator Bot",
+  "description": "A Telegram bot that generates ready-to-use Pyrogram bot script templates.",
+  "keywords": ["telegram", "pyrogram", "bot", "python"],
+  "repository": "https://github.com/yourusername/pyrogram-generator-bot",
+  "env": {
+    "API_ID": {
+      "description": "Your Telegram API ID from https://my.telegram.org",
+      "required": true
+    },
+    "API_HASH": {
+      "description": "Your Telegram API HASH from https://my.telegram.org",
+      "required": true
+    },
+    "BOT_TOKEN": {
+      "description": "Your bot token from @BotFather",
+      "required": true
+    }
+  },
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "eco"
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ]
+}
