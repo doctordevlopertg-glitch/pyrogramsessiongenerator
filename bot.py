@@ -1,45 +1,68 @@
 """
-Pyrogram Script Generator Bot
-=============================
-A Telegram bot (built with Pyrogram) that generates ready-to-use
-Pyrogram bot script templates on demand, and lets the user download
-them as a .py file. Deployable to Heroku.
+Pyrogram Session String Generator Bot
+======================================
+A Telegram bot that walks a user through generating a Pyrogram
+*user* session string:
 
-Commands:
-    /start      - welcome message + menu
-    /generate   - pick a template and get a generated script
-    /help       - usage info
+    /generate  ->  bot asks for API_ID
+                ->  bot asks for API_HASH
+                ->  bot asks for phone number (international format)
+                ->  bot sends an OTP code to that account via Telegram
+                ->  user sends the code back to the bot
+                ->  (if 2FA is enabled) bot asks for the cloud password
+                ->  bot replies with the session string
 
-Environment variables required (set these in Heroku Config Vars):
-    API_ID      - your Telegram API ID        (https://my.telegram.org)
-    API_HASH    - your Telegram API HASH
-    BOT_TOKEN   - your bot token from @BotFather
+IMPORTANT SECURITY NOTES (read before deploying / using):
+  - A Pyrogram session string grants FULL access to the Telegram account
+    it was generated for (read messages, send messages, delete account,
+    etc.), exactly like the account's login session. Treat it like a
+    password. Never send it to anyone, never paste it in a public chat.
+  - This bot should only be used by you, for your own account(s), ideally
+    in a private chat with a bot only you control. Anyone who can talk to
+    this bot and complete the phone+code (+password) flow can generate a
+    session for whatever phone number they enter — that's inherent to how
+    Telegram login works, not something this script can restrict beyond
+    the OTP/2FA check.
+  - The bot deletes the message containing the user's OTP code and 2FA
+    password from the chat as soon as it processes them (best-effort;
+    Telegram may prevent deletion in some edge cases), and never logs
+    them to disk.
+  - The bot itself (BOT_TOKEN/API_ID/API_HASH in your environment) is
+    just used to run the *bot*; the account being logged into during
+    /generate is a separate, user-supplied API_ID/API_HASH/phone.
+
+Environment variables required for the BOT itself (Heroku Config Vars):
+    API_ID      - API ID for the *bot* client (https://my.telegram.org)
+    API_HASH    - API HASH for the *bot* client
+    BOT_TOKEN   - bot token from @BotFather
 """
 
 import os
-import io
 import logging
-from datetime import datetime
 
 from pyrogram import Client, filters
-from pyrogram.types import (
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-    Message,
+from pyrogram.types import Message
+from pyrogram.errors import (
+    ApiIdInvalid,
+    PhoneNumberInvalid,
+    PhoneCodeInvalid,
+    PhoneCodeExpired,
+    PasswordHashInvalid,
+    SessionPasswordNeeded,
+    FloodWait,
 )
 
 # --------------------------------------------------------------------------
-# Config
+# Config for the bot itself
 # --------------------------------------------------------------------------
 
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
+BOT_API_ID = int(os.environ.get("API_ID", "0"))
+BOT_API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-if not (API_ID and API_HASH and BOT_TOKEN):
+if not (BOT_API_ID and BOT_API_HASH and BOT_TOKEN):
     raise SystemExit(
-        "Missing API_ID / API_HASH / BOT_TOKEN. "
+        "Missing API_ID / API_HASH / BOT_TOKEN for the bot itself. "
         "Set them as environment variables (Heroku Config Vars)."
     )
 
@@ -47,339 +70,306 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-log = logging.getLogger("generator-bot")
+log = logging.getLogger("session-gen-bot")
 
-app = Client(
-    "pyrogram_generator_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
+bot = Client(
+    "session_generator_bot",
+    api_id=BOT_API_ID,
+    api_hash=BOT_API_HASH,
     bot_token=BOT_TOKEN,
 )
 
 # --------------------------------------------------------------------------
-# Templates
-# A dict of template_id -> (title, description, generator_function)
-# Each generator function returns the full source code of a standalone
-# Pyrogram script as a string.
+# Per-user conversation state
+# --------------------------------------------------------------------------
+# sessions[user_id] = {
+#     "step": "api_id" | "api_hash" | "phone" | "code" | "password",
+#     "api_id": int,
+#     "api_hash": str,
+#     "phone": str,
+#     "phone_code_hash": str,
+#     "client": Client,   # temporary user-login client (in_memory)
+# }
+sessions: dict[int, dict] = {}
+
+STEP_API_ID = "api_id"
+STEP_API_HASH = "api_hash"
+STEP_PHONE = "phone"
+STEP_CODE = "code"
+STEP_PASSWORD = "password"
+
+CANCEL_HINT = "\n\nSend /cancel at any time to stop."
+
+
+async def cleanup(user_id: int, disconnect: bool = True):
+    """Remove state and disconnect any temporary login client."""
+    state = sessions.pop(user_id, None)
+    if state and disconnect:
+        client = state.get("client")
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
+async def safe_delete(message: Message):
+    """Best-effort delete of a message that contained sensitive input."""
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Command handlers
 # --------------------------------------------------------------------------
 
 
-def tpl_echo() -> str:
-    return '''"""
-Echo Bot — generated by Pyrogram Script Generator Bot
-Replies to every text message with the same text.
-"""
-
-import os
-from pyrogram import Client, filters
-
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-
-app = Client("echo_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-
-@app.on_message(filters.command("start"))
-async def start(client, message):
-    await message.reply_text("Hi! Send me any text and I will echo it back.")
-
-
-@app.on_message(filters.text & ~filters.command("start"))
-async def echo(client, message):
-    await message.reply_text(message.text)
-
-
-if __name__ == "__main__":
-    app.run()
-'''
-
-
-def tpl_welcome() -> str:
-    return '''"""
-Group Welcome Bot — generated by Pyrogram Script Generator Bot
-Greets new members when they join a group/supergroup.
-"""
-
-import os
-from pyrogram import Client, filters
-from pyrogram.types import ChatMemberUpdated
-
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-
-app = Client("welcome_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-
-@app.on_message(filters.new_chat_members)
-async def welcome(client, message):
-    for member in message.new_chat_members:
-        name = member.first_name or "there"
-        await message.reply_text(
-            f"Welcome, {name}! Please read the group rules pinned above."
-        )
-
-
-@app.on_message(filters.command("start"))
-async def start(client, message):
-    await message.reply_text("Welcome bot is running. Add me to a group as admin.")
-
-
-if __name__ == "__main__":
-    app.run()
-'''
-
-
-def tpl_admin() -> str:
-    return '''"""
-Admin/Moderation Bot — generated by Pyrogram Script Generator Bot
-Basic group moderation: /ban, /unban, /mute, /unmute, /kick.
-Bot must be a group admin with the relevant permissions.
-"""
-
-import os
-from pyrogram import Client, filters
-from pyrogram.types import ChatPermissions
-
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-
-app = Client("admin_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-
-def admin_only(func):
-    async def wrapper(client, message):
-        member = await client.get_chat_member(message.chat.id, message.from_user.id)
-        if member.status not in ("administrator", "creator"):
-            await message.reply_text("You must be an admin to use this command.")
-            return
-        await func(client, message)
-    return wrapper
-
-
-@app.on_message(filters.command("ban") & filters.group)
-@admin_only
-async def ban(client, message):
-    if not message.reply_to_message:
-        await message.reply_text("Reply to a user's message with /ban.")
-        return
-    target = message.reply_to_message.from_user.id
-    await client.ban_chat_member(message.chat.id, target)
-    await message.reply_text("User banned.")
-
-
-@app.on_message(filters.command("unban") & filters.group)
-@admin_only
-async def unban(client, message):
-    if not message.reply_to_message:
-        await message.reply_text("Reply to a user's message with /unban.")
-        return
-    target = message.reply_to_message.from_user.id
-    await client.unban_chat_member(message.chat.id, target)
-    await message.reply_text("User unbanned.")
-
-
-@app.on_message(filters.command("mute") & filters.group)
-@admin_only
-async def mute(client, message):
-    if not message.reply_to_message:
-        await message.reply_text("Reply to a user's message with /mute.")
-        return
-    target = message.reply_to_message.from_user.id
-    await client.restrict_chat_member(
-        message.chat.id, target, ChatPermissions()
-    )
-    await message.reply_text("User muted.")
-
-
-@app.on_message(filters.command("unmute") & filters.group)
-@admin_only
-async def unmute(client, message):
-    if not message.reply_to_message:
-        await message.reply_text("Reply to a user's message with /unmute.")
-        return
-    target = message.reply_to_message.from_user.id
-    await client.restrict_chat_member(
-        message.chat.id,
-        target,
-        ChatPermissions(
-            can_send_messages=True,
-            can_send_media_messages=True,
-            can_send_other_messages=True,
-        ),
-    )
-    await message.reply_text("User unmuted.")
-
-
-@app.on_message(filters.command("kick") & filters.group)
-@admin_only
-async def kick(client, message):
-    if not message.reply_to_message:
-        await message.reply_text("Reply to a user's message with /kick.")
-        return
-    target = message.reply_to_message.from_user.id
-    await client.ban_chat_member(message.chat.id, target)
-    await client.unban_chat_member(message.chat.id, target)
-    await message.reply_text("User kicked.")
-
-
-if __name__ == "__main__":
-    app.run()
-'''
-
-
-def tpl_inline() -> str:
-    return '''"""
-Inline Query Bot — generated by Pyrogram Script Generator Bot
-Responds to inline queries (typed as @yourbot query in any chat).
-"""
-
-import os
-from pyrogram import Client, filters
-from pyrogram.types import InlineQueryResultArticle, InputTextMessageContent
-
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-
-app = Client("inline_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-
-@app.on_inline_query()
-async def answer(client, inline_query):
-    query = inline_query.query or "Hello"
-    results = [
-        InlineQueryResultArticle(
-            title="Send this text",
-            input_message_content=InputTextMessageContent(query),
-            description=f"Sends: {query}",
-        )
-    ]
-    await inline_query.answer(results, cache_time=1)
-
-
-@app.on_message(filters.command("start"))
-async def start(client, message):
-    await message.reply_text("Try me inline: type @your_bot_username and any text.")
-
-
-if __name__ == "__main__":
-    app.run()
-'''
-
-
-def tpl_callback() -> str:
-    return '''"""
-Inline Buttons / Callback Bot — generated by Pyrogram Script Generator Bot
-Demonstrates inline keyboards and callback query handling.
-"""
-
-import os
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-
-app = Client("callback_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-
-@app.on_message(filters.command("start"))
-async def start(client, message):
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Option A", callback_data="opt_a")],
-            [InlineKeyboardButton("Option B", callback_data="opt_b")],
-        ]
-    )
-    await message.reply_text("Choose an option:", reply_markup=keyboard)
-
-
-@app.on_callback_query()
-async def on_callback(client, callback_query):
-    choice = callback_query.data
-    await callback_query.answer(f"You picked {choice}", show_alert=False)
-    await callback_query.message.edit_text(f"You selected: {choice}")
-
-
-if __name__ == "__main__":
-    app.run()
-'''
-
-
-TEMPLATES = {
-    "echo": ("Echo Bot", "Replies with whatever text you send it.", tpl_echo),
-    "welcome": ("Group Welcome Bot", "Greets new members on join.", tpl_welcome),
-    "admin": ("Admin/Moderation Bot", "ban/unban/mute/unmute/kick commands.", tpl_admin),
-    "inline": ("Inline Query Bot", "Handles @bot inline queries.", tpl_inline),
-    "callback": ("Inline Buttons Bot", "Inline keyboards + callback queries.", tpl_callback),
-}
-
-# --------------------------------------------------------------------------
-# Handlers
-# --------------------------------------------------------------------------
-
-
-def build_menu() -> InlineKeyboardMarkup:
-    rows = []
-    for key, (title, _desc, _fn) in TEMPLATES.items():
-        rows.append([InlineKeyboardButton(title, callback_data=f"gen:{key}")])
-    return InlineKeyboardMarkup(rows)
-
-
-@app.on_message(filters.command("start"))
+@bot.on_message(filters.command("start") & filters.private)
 async def start_cmd(client: Client, message: Message):
     await message.reply_text(
-        "**Pyrogram Script Generator Bot**\n\n"
-        "I generate ready-to-run Pyrogram bot scripts.\n"
-        "Use /generate to pick a template, or /help for more info.",
+        "**Pyrogram Session String Generator**\n\n"
+        "This bot logs into a Telegram account (using its own API_ID / "
+        "API_HASH + your phone number + OTP, and 2FA password if set) "
+        "and gives you back a Pyrogram session string for it.\n\n"
+        "⚠️ A session string is equivalent to your account password — "
+        "never share it with anyone. Only use this bot on yourself, "
+        "in a private chat with a bot you trust/control.\n\n"
+        "Send /generate to begin."
     )
 
 
-@app.on_message(filters.command("help"))
-async def help_cmd(client: Client, message: Message):
-    lines = ["**Available templates:**\n"]
-    for key, (title, desc, _fn) in TEMPLATES.items():
-        lines.append(f"• `{key}` — {title}: {desc}")
-    lines.append("\nRun /generate to choose one interactively.")
-    await message.reply_text("\n".join(lines))
+@bot.on_message(filters.command("cancel") & filters.private)
+async def cancel_cmd(client: Client, message: Message):
+    if message.from_user.id in sessions:
+        await cleanup(message.from_user.id)
+        await message.reply_text("Cancelled. Send /generate to start again.")
+    else:
+        await message.reply_text("Nothing to cancel.")
 
 
-@app.on_message(filters.command("generate"))
+@bot.on_message(filters.command("generate") & filters.private)
 async def generate_cmd(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id in sessions:
+        await cleanup(user_id)
+
+    sessions[user_id] = {"step": STEP_API_ID}
     await message.reply_text(
-        "Pick a template to generate:",
-        reply_markup=build_menu(),
+        "Step 1/4 — Send your **API_ID**.\n"
+        "(Get it from https://my.telegram.org → API Development Tools)"
+        + CANCEL_HINT
     )
 
 
-@app.on_callback_query(filters.regex(r"^gen:(\w+)$"))
-async def on_generate(client: Client, callback_query: CallbackQuery):
-    key = callback_query.matches[0].group(1)
-    template = TEMPLATES.get(key)
-    if not template:
-        await callback_query.answer("Unknown template.", show_alert=True)
+@bot.on_message(filters.command("help") & filters.private)
+async def help_cmd(client: Client, message: Message):
+    await message.reply_text(
+        "**How this works**\n"
+        "1. /generate\n"
+        "2. Send your API_ID\n"
+        "3. Send your API_HASH\n"
+        "4. Send your phone number (e.g. +15551234567)\n"
+        "5. Send the OTP code Telegram sends you\n"
+        "6. If 2FA is on, send your cloud password\n"
+        "7. Receive your Pyrogram session string\n\n"
+        "/cancel — abort the current flow at any point."
+    )
+
+
+# --------------------------------------------------------------------------
+# Conversation flow (plain text messages, routed by current step)
+# --------------------------------------------------------------------------
+
+
+@bot.on_message(
+    filters.private
+    & filters.text
+    & ~filters.command(["start", "generate", "cancel", "help"])
+)
+async def on_text(client: Client, message: Message):
+    user_id = message.from_user.id
+    state = sessions.get(user_id)
+    if not state:
+        await message.reply_text("Send /generate to start creating a session string.")
         return
 
-    title, _desc, generator_fn = template
-    source_code = generator_fn()
+    step = state["step"]
 
-    file_bytes = io.BytesIO(source_code.encode("utf-8"))
-    file_bytes.name = f"{key}_bot.py"
+    if step == STEP_API_ID:
+        await handle_api_id(message, state)
+    elif step == STEP_API_HASH:
+        await handle_api_hash(message, state)
+    elif step == STEP_PHONE:
+        await handle_phone(message, state)
+    elif step == STEP_CODE:
+        await handle_code(message, state)
+    elif step == STEP_PASSWORD:
+        await handle_password(message, state)
 
-    await callback_query.answer("Generating...")
-    await callback_query.message.reply_document(
-        document=file_bytes,
-        caption=(
-            f"**{title}**\n\n"
-            f"Generated on {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-            "Set `API_ID`, `API_HASH`, `BOT_TOKEN` as environment variables "
-            "before running this script."
-        ),
+
+async def handle_api_id(message: Message, state: dict):
+    text = message.text.strip()
+    if not text.isdigit():
+        await message.reply_text("That doesn't look like a number. Send just your API_ID (digits only).")
+        return
+    state["api_id"] = int(text)
+    state["step"] = STEP_API_HASH
+    await message.reply_text("Step 2/4 — Now send your **API_HASH**." + CANCEL_HINT)
+
+
+async def handle_api_hash(message: Message, state: dict):
+    api_hash = message.text.strip()
+    if len(api_hash) < 10:
+        await message.reply_text("That doesn't look like a valid API_HASH. Please check and resend.")
+        return
+    state["api_hash"] = api_hash
+    state["step"] = STEP_PHONE
+    await safe_delete(message)  # api_hash is semi-sensitive; tidy the chat
+    await message.reply_text(
+        "Step 3/4 — Send your phone number in **international format**, "
+        "e.g. `+15551234567`." + CANCEL_HINT
     )
+
+
+async def handle_phone(message: Message, state: dict):
+    phone = message.text.strip()
+    if not phone.startswith("+") or not phone[1:].replace(" ", "").isdigit():
+        await message.reply_text("Please send the phone number in international format, e.g. `+15551234567`.")
+        return
+
+    status_msg = await message.reply_text("Connecting and requesting an OTP code, please wait...")
+
+    login_client = Client(
+        name=":memory:",
+        api_id=state["api_id"],
+        api_hash=state["api_hash"],
+        in_memory=True,
+    )
+
+    try:
+        await login_client.connect()
+        sent_code = await login_client.send_code(phone)
+    except ApiIdInvalid:
+        await status_msg.edit_text("Invalid API_ID / API_HASH pair. Send /generate to try again.")
+        await cleanup(message.from_user.id)
+        return
+    except PhoneNumberInvalid:
+        await status_msg.edit_text("Invalid phone number. Send /generate to try again.")
+        await cleanup(message.from_user.id)
+        return
+    except FloodWait as e:
+        await status_msg.edit_text(f"Rate limited by Telegram. Try again in {e.value} seconds.")
+        await cleanup(message.from_user.id)
+        return
+    except Exception as e:
+        log.exception("send_code failed")
+        await status_msg.edit_text(f"Failed to send code: {e}\nSend /generate to try again.")
+        await cleanup(message.from_user.id)
+        return
+
+    state["phone"] = phone
+    state["phone_code_hash"] = sent_code.phone_code_hash
+    state["client"] = login_client
+    state["step"] = STEP_CODE
+
+    await status_msg.edit_text(
+        "Step 4/4 — Enter the login code Telegram just sent you.\n\n"
+        "To avoid Telegram auto-invalidating the code, type it with "
+        "extra characters around the digits, e.g. if the code is "
+        "`12345` send `1-2-3-4-5` or `a12345b`. I'll strip non-digits."
+        + CANCEL_HINT
+    )
+
+
+async def handle_code(message: Message, state: dict):
+    raw = message.text.strip()
+    code = "".join(ch for ch in raw if ch.isdigit())
+    await safe_delete(message)
+
+    if not code:
+        await message.reply_text("That didn't contain any digits. Please resend the code.")
+        return
+
+    login_client: Client = state["client"]
+
+    try:
+        await login_client.sign_in(
+            phone_number=state["phone"],
+            phone_code_hash=state["phone_code_hash"],
+            phone_code=code,
+        )
+    except PhoneCodeInvalid:
+        await message.reply_text("Invalid code. Please resend the code Telegram sent you.")
+        return
+    except PhoneCodeExpired:
+        await message.reply_text("Code expired. Send /generate to start over.")
+        await cleanup(message.from_user.id)
+        return
+    except SessionPasswordNeeded:
+        state["step"] = STEP_PASSWORD
+        await message.reply_text(
+            "This account has Two-Step Verification enabled.\n"
+            "Send your **cloud password**." + CANCEL_HINT
+        )
+        return
+    except FloodWait as e:
+        await message.reply_text(f"Rate limited by Telegram. Try again in {e.value} seconds.")
+        await cleanup(message.from_user.id)
+        return
+    except Exception as e:
+        log.exception("sign_in failed")
+        await message.reply_text(f"Sign-in failed: {e}\nSend /generate to try again.")
+        await cleanup(message.from_user.id)
+        return
+
+    await finish_and_send_session(message, state)
+
+
+async def handle_password(message: Message, state: dict):
+    password = message.text
+    await safe_delete(message)
+
+    login_client: Client = state["client"]
+
+    try:
+        await login_client.check_password(password)
+    except PasswordHashInvalid:
+        await message.reply_text("Incorrect password. Please try again.")
+        return
+    except FloodWait as e:
+        await message.reply_text(f"Rate limited by Telegram. Try again in {e.value} seconds.")
+        await cleanup(message.from_user.id)
+        return
+    except Exception as e:
+        log.exception("check_password failed")
+        await message.reply_text(f"Password check failed: {e}\nSend /generate to try again.")
+        await cleanup(message.from_user.id)
+        return
+
+    await finish_and_send_session(message, state)
+
+
+async def finish_and_send_session(message: Message, state: dict):
+    login_client: Client = state["client"]
+    try:
+        session_string = await login_client.export_session_string()
+    except Exception as e:
+        log.exception("export_session_string failed")
+        await message.reply_text(f"Could not export session string: {e}")
+        await cleanup(message.from_user.id)
+        return
+
+    await message.reply_text(
+        "✅ **Session generated successfully.**\n\n"
+        "`" + session_string + "`\n\n"
+        "⚠️ Copy this now and store it somewhere safe (e.g. as a Heroku "
+        "config var `SESSION_STRING`). This message will not be shown "
+        "again — treat this string like a password and never share it. "
+        "Anyone with this string has full access to the account."
+    )
+    await cleanup(message.from_user.id)
 
 
 # --------------------------------------------------------------------------
@@ -387,5 +377,5 @@ async def on_generate(client: Client, callback_query: CallbackQuery):
 # --------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    log.info("Starting Pyrogram Script Generator Bot...")
-    app.run()
+    log.info("Starting Pyrogram Session String Generator Bot...")
+    bot.run()

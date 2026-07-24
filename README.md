@@ -1,25 +1,55 @@
-# Pyrogram Script Generator Bot
+# Pyrogram Session String Generator Bot
 
-A Telegram bot, built with [Pyrogram](https://docs.pyrogram.org/), that lets
-users pick a bot "template" from a menu and instantly get back a ready-to-run
-Pyrogram bot script as a downloadable `.py` file.
+A Telegram bot that walks a user through a login flow and hands back a
+**Pyrogram session string** — the same thing you'd normally get from running
+Pyrogram's interactive `Client(...).start()` prompt on a terminal, but done
+conversationally through Telegram itself.
 
-Included templates:
+Flow:
 
-| Key        | Template               | What it does                                   |
-|------------|-------------------------|-------------------------------------------------|
-| `echo`     | Echo Bot                | Replies with whatever text you send it          |
-| `welcome`  | Group Welcome Bot       | Greets new members when they join a group       |
-| `admin`    | Admin/Moderation Bot    | `/ban /unban /mute /unmute /kick` commands      |
-| `inline`   | Inline Query Bot        | Handles `@bot query` inline mode                |
-| `callback` | Inline Buttons Bot      | Inline keyboards + callback query handling      |
+```
+/generate
+  -> bot: send your API_ID
+  -> you: 123456
+  -> bot: send your API_HASH
+  -> you: abcdef0123456789abcdef0123456789
+  -> bot: send your phone number
+  -> you: +15551234567
+  -> bot: (sends OTP to that account) enter the code
+  -> you: a12345b
+  -> bot: (if 2FA is on) send your password
+  -> you: ********
+  -> bot: here's your session string
+```
 
-## 1. Get your credentials
+## ⚠️ Security — read this first
+
+A Pyrogram **session string is equivalent to a password** for the Telegram
+account it was generated for. Anyone who has it can read messages, send
+messages, join/leave chats, and generally act as that account, without
+needing the phone or the OTP again.
+
+- Only run this bot for yourself, against your own account, in a private
+  chat with a bot **only you** control (i.e., don't add it to a group, and
+  don't hand the bot token to anyone else).
+- The bot best-effort deletes the messages containing your OTP code and 2FA
+  password right after processing them, and never writes them to disk — but
+  Telegram's own chat history on your device will still show whatever you
+  typed unless you delete it yourself too.
+- Never paste a session string into a chat, issue tracker, or anywhere
+  public. If one ever leaks, revoke it immediately from **Telegram Settings
+  → Devices → [that session] → Terminate**, or terminate all other sessions.
+- This script does not add its own extra authentication in front of the
+  Telegram login step — the security boundary is exactly Telegram's own
+  OTP + 2FA, same as logging in anywhere else.
+
+## 1. Get credentials for the bot itself
 
 1. **API_ID / API_HASH** — create an app at https://my.telegram.org → API
-   Development Tools.
-2. **BOT_TOKEN** — talk to [@BotFather](https://t.me/BotFather) on Telegram,
-   run `/newbot`, and copy the token it gives you.
+   Development Tools. (This is for the *bot's* own Pyrogram client — you'll
+   supply a separate API_ID/API_HASH for the account you're generating a
+   session for, inside the chat.)
+2. **BOT_TOKEN** — from [@BotFather](https://t.me/BotFather) → `/newbot`.
 
 ## 2. Run locally (optional, to test first)
 
@@ -35,7 +65,7 @@ export BOT_TOKEN=your_bot_token
 python bot.py
 ```
 
-Then open Telegram, find your bot, and send `/start`.
+Open a private chat with your bot in Telegram and send `/generate`.
 
 ## 3. Deploy to Heroku
 
@@ -55,49 +85,35 @@ git push heroku main
 heroku ps:scale worker=1
 ```
 
-### Option B — Deploy Button (needs the repo pushed to GitHub first)
+### Option B — Deploy Button
 
 1. Push this folder to a GitHub repo.
-2. Update the `"repository"` field in `app.json` to point at that repo.
-3. Add a button to your repo's README:
+2. Update `"repository"` in `app.json` to point at that repo.
+3. Add to your repo's README:
 
    ```markdown
    [![Deploy](https://www.herokuapp.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/yourusername/pyrogram-generator-bot)
    ```
 
-4. Click it, fill in `API_ID` / `API_HASH` / `BOT_TOKEN`, and deploy.
-5. After deploy, go to **Resources** in the Heroku dashboard and make sure the
-   `worker` dyno is turned **on** (Heroku doesn't auto-start worker dynos).
+4. Click it, fill in `API_ID` / `API_HASH` / `BOT_TOKEN`, deploy.
+5. In the Heroku dashboard → **Resources**, make sure the `worker` dyno is
+   turned **on** (worker dynos don't auto-start).
 
-## 4. Usage in Telegram
+## 4. Bot commands
 
-- `/start` — welcome message
-- `/help` — lists all templates
-- `/generate` — shows inline buttons; tap one to receive that template as a
-  `.py` file, ready to fill in your own `API_ID` / `API_HASH` / `BOT_TOKEN`
-  and run.
-
-## 5. Adding your own templates
-
-Open `bot.py`, add a new `tpl_<name>()` function that returns a string of
-Python source code, then register it in the `TEMPLATES` dict near the top of
-the handlers section:
-
-```python
-TEMPLATES = {
-    ...
-    "mytemplate": ("My Template", "What it does", tpl_mytemplate),
-}
-```
-
-It will automatically show up in `/generate` and `/help`.
+- `/start` — welcome + security notice
+- `/generate` — begins the API_ID → API_HASH → phone → code → (password)
+  → session string flow
+- `/cancel` — aborts the current flow and disconnects the temporary client
+- `/help` — quick recap of the steps
 
 ## Notes
 
-- This bot runs as a Heroku **worker** dyno (long-polling), not a web dyno —
-  there's no HTTP server to bind to `$PORT`. Free/eco dynos will sleep after
-  inactivity unless you're on a plan that keeps workers alive continuously;
-  check current Heroku dyno behavior in your dashboard, since Heroku's free
-  tier has changed over time.
-- Keep `API_HASH` and `BOT_TOKEN` secret — never commit them to source
-  control. Use Heroku Config Vars (or a local `.env` you don't commit).
+- Runs as a Heroku **worker** dyno (long-polling) — there's no HTTP server
+  bound to `$PORT`.
+- The temporary login client uses `in_memory=True`, so nothing is written to
+  disk on the server; the session only exists in memory until it's exported
+  as a string and sent to the user, then the client disconnects.
+- If Telegram invalidates the OTP code because it detects it was typed in
+  plain digit form, the bot's prompt tells you to send it with extra
+  characters mixed in (e.g. `a12345b`) — it strips non-digits before use.
